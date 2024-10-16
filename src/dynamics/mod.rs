@@ -62,6 +62,10 @@ pub use self::solarpressure::*;
 pub mod drag;
 pub use self::drag::*;
 
+// Defines the data use for Pines's algorithm for calculating graviational harmonics
+pub mod pines;
+pub use self::pines::*;
+
 /// Define the spherical harmonic models.
 pub mod sph_harmonics;
 pub use self::sph_harmonics::*;

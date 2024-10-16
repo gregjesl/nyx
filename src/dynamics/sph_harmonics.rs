@@ -21,14 +21,16 @@ use anise::prelude::Almanac;
 use snafu::ResultExt;
 
 use crate::cosmic::{AstroPhysicsSnafu, Frame, Orbit};
-use crate::dynamics::AccelModel;
+use crate::dynamics::{AccelModel, Pines};
 use crate::io::gravity::HarmonicsMem;
-use crate::linalg::{DMatrix, Matrix3, Vector3, Vector4, U7};
+use crate::linalg::{Matrix3, Vector3, Vector4, U7};
 use hyperdual::linalg::norm;
 use hyperdual::{hyperspace_from_vector, Float, OHyperdual};
 use std::cmp::min;
 use std::fmt;
-use std::sync::Arc;
+use std::panic;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use super::{DynamicsAlmanacSnafu, DynamicsAstroSnafu, DynamicsError};
 
@@ -36,100 +38,17 @@ use super::{DynamicsAlmanacSnafu, DynamicsAstroSnafu, DynamicsError};
 pub struct Harmonics {
     compute_frame: Frame,
     stor: HarmonicsMem,
-    a_nm: DMatrix<f64>,
-    b_nm: DMatrix<f64>,
-    c_nm: DMatrix<f64>,
-    vr01: DMatrix<f64>,
-    vr11: DMatrix<f64>,
-    a_nm_h: DMatrix<OHyperdual<f64, U7>>,
-    b_nm_h: DMatrix<OHyperdual<f64, U7>>,
-    c_nm_h: DMatrix<OHyperdual<f64, U7>>,
-    vr01_h: DMatrix<OHyperdual<f64, U7>>,
-    vr11_h: DMatrix<OHyperdual<f64, U7>>,
+    pines: Arc<Pines>,
 }
 
 impl Harmonics {
     /// Create a new Harmonics dynamical model from the provided gravity potential storage instance.
     pub fn from_stor(compute_frame: Frame, stor: HarmonicsMem) -> Arc<Self> {
-        let degree_np2 = stor.max_degree_n() + 2;
-        let mut a_nm = DMatrix::from_element(degree_np2 + 1, degree_np2 + 1, 0.0);
-        let mut b_nm = DMatrix::from_element(degree_np2, degree_np2, 0.0);
-        let mut c_nm = DMatrix::from_element(degree_np2, degree_np2, 0.0);
-        let mut vr01 = DMatrix::from_element(degree_np2, degree_np2, 0.0);
-        let mut vr11 = DMatrix::from_element(degree_np2, degree_np2, 0.0);
-
-        // Initialize the diagonal elements (not a function of the input)
-        a_nm[(0, 0)] = 1.0;
-        for n in 1..=degree_np2 {
-            let nf64 = n as f64;
-            // Diagonal element
-            a_nm[(n, n)] = (1.0 + 1.0 / (2.0 * nf64)).sqrt() * a_nm[(n - 1, n - 1)];
-        }
-
-        // Pre-compute the B_nm, C_nm, vr01 and vr11 storages
-        for n in 0..degree_np2 {
-            for m in 0..degree_np2 {
-                let nf64 = n as f64;
-                let mf64 = m as f64;
-                // Compute c_nm, which is B_nm/B_(n-1,m) in Jones' dissertation
-                c_nm[(n, m)] = (((2.0 * nf64 + 1.0) * (nf64 + mf64 - 1.0) * (nf64 - mf64 - 1.0))
-                    / ((nf64 - mf64) * (nf64 + mf64) * (2.0 * nf64 - 3.0)))
-                    .sqrt();
-
-                b_nm[(n, m)] = (((2.0 * nf64 + 1.0) * (2.0 * nf64 - 1.0))
-                    / ((nf64 + mf64) * (nf64 - mf64)))
-                    .sqrt();
-
-                vr01[(n, m)] = ((nf64 - mf64) * (nf64 + mf64 + 1.0)).sqrt();
-                vr11[(n, m)] = (((2.0 * nf64 + 1.0) * (nf64 + mf64 + 2.0) * (nf64 + mf64 + 1.0))
-                    / (2.0 * nf64 + 3.0))
-                    .sqrt();
-
-                if m == 0 {
-                    vr01[(n, m)] /= 2.0_f64.sqrt();
-                    vr11[(n, m)] /= 2.0_f64.sqrt();
-                }
-            }
-        }
-
-        // Repeat for the hyperdual part in case we need to super the partials
-        let mut a_nm_h =
-            DMatrix::from_element(degree_np2 + 1, degree_np2 + 1, OHyperdual::from(0.0));
-        let mut b_nm_h = DMatrix::from_element(degree_np2, degree_np2, OHyperdual::from(0.0));
-        let mut c_nm_h = DMatrix::from_element(degree_np2, degree_np2, OHyperdual::from(0.0));
-        let mut vr01_h = DMatrix::from_element(degree_np2, degree_np2, OHyperdual::from(0.0));
-        let mut vr11_h = DMatrix::from_element(degree_np2, degree_np2, OHyperdual::from(0.0));
-
-        // initialize the diagonal elements (not a function of the input)
-        a_nm_h[(0, 0)] = OHyperdual::from(1.0);
-        for n in 1..=degree_np2 {
-            // Diagonal element
-            a_nm_h[(n, n)] = OHyperdual::from(a_nm[(n, n)]);
-        }
-
-        // Pre-compute the B_nm, C_nm, vr01 and vr11 storages
-        for n in 0..degree_np2 {
-            for m in 0..degree_np2 {
-                vr01_h[(n, m)] = OHyperdual::from(vr01[(n, m)]);
-                vr11_h[(n, m)] = OHyperdual::from(vr11[(n, m)]);
-                b_nm_h[(n, m)] = OHyperdual::from(b_nm[(n, m)]);
-                c_nm_h[(n, m)] = OHyperdual::from(c_nm[(n, m)]);
-            }
-        }
-
+        let degree = stor.max_degree_n();
         Arc::new(Self {
             compute_frame,
             stor,
-            a_nm,
-            b_nm,
-            c_nm,
-            vr01,
-            vr11,
-            a_nm_h,
-            b_nm_h,
-            c_nm_h,
-            vr01_h,
-            vr11_h,
+            pines: Pines::new(degree),
         })
     }
 }
@@ -148,6 +67,9 @@ impl fmt::Display for Harmonics {
 
 impl AccelModel for Harmonics {
     fn eom(&self, osc: &Orbit, almanac: Arc<Almanac>) -> Result<Vector3<f64>, DynamicsError> {
+        // Get a reference to Pines
+        let pines = Arc::clone(&self.pines);
+
         // Convert the osculating orbit to the correct frame (needed for multiple harmonic fields)
         let state = almanac
             .transform_to(*osc, self.compute_frame, None)
@@ -164,7 +86,7 @@ impl AccelModel for Harmonics {
         let max_order = self.stor.max_order_m(); // In GMAT, the order is MM
 
         // Create the associated Legendre polynomials. Note that we add three items as per GMAT (this may be useful for the STM)
-        let mut a_nm = self.a_nm.clone();
+        let mut a_nm = pines.a_nm.clone();
 
         // Initialize the diagonal elements (not a function of the input)
         a_nm[(1, 0)] = u_ * 3.0f64.sqrt();
@@ -177,8 +99,8 @@ impl AccelModel for Harmonics {
         for m in 0..=max_order + 1 {
             for n in (m + 2)..=max_degree + 1 {
                 let hm_idx = (n, m);
-                a_nm[hm_idx] = u_ * self.b_nm[hm_idx] * a_nm[(n - 1, m)]
-                    - self.c_nm[hm_idx] * a_nm[(n - 2, m)];
+                a_nm[hm_idx] = u_ * pines.b_nm[hm_idx] * a_nm[(n - 1, m)]
+                    - pines.c_nm[hm_idx] * a_nm[(n - 2, m)];
             }
         }
 
@@ -208,38 +130,51 @@ impl AccelModel for Harmonics {
 
         let rho = eq_radius_km / r_;
         let mut rho_np1 = mu_km3_s2 / r_ * rho;
-        let mut accel4: Vector4<f64> = Vector4::zeros();
+        let accel4 = Arc::new(Mutex::new(Vector4::zeros()));
+        let thread_accel = Arc::clone(&accel4);
+        let stor = self.stor.clone();
 
-        for n in 1..max_degree {
-            let mut sum: Vector4<f64> = Vector4::zeros();
-            rho_np1 *= rho;
+        let handle = thread::spawn(move || {
+            for n in 1..max_degree {
+                let mut sum: Vector4<f64> = Vector4::zeros();
+                rho_np1 *= rho;
 
-            for m in 0..=min(n, max_order) {
-                let (c_val, s_val) = self.stor.cs_nm(n, m);
-                let d_ = (c_val * r_m[m] + s_val * i_m[m]) * 2.0.sqrt();
-                let e_ = if m == 0 {
-                    0.0
-                } else {
-                    (c_val * r_m[m - 1] + s_val * i_m[m - 1]) * 2.0.sqrt()
-                };
-                let f_ = if m == 0 {
-                    0.0
-                } else {
-                    (s_val * r_m[m - 1] - c_val * i_m[m - 1]) * 2.0.sqrt()
-                };
+                for m in 0..=min(n, max_order) {
+                    let (c_val, s_val) = stor.cs_nm(n, m);
+                    let d_ = (c_val * r_m[m] + s_val * i_m[m]) * 2.0.sqrt();
+                    let e_ = if m == 0 {
+                        0.0
+                    } else {
+                        (c_val * r_m[m - 1] + s_val * i_m[m - 1]) * 2.0.sqrt()
+                    };
+                    let f_ = if m == 0 {
+                        0.0
+                    } else {
+                        (s_val * r_m[m - 1] - c_val * i_m[m - 1]) * 2.0.sqrt()
+                    };
 
-                sum.x += (m as f64) * a_nm[(n, m)] * e_;
-                sum.y += (m as f64) * a_nm[(n, m)] * f_;
-                sum.z += self.vr01[(n, m)] * a_nm[(n, m + 1)] * d_;
-                sum.w -= self.vr11[(n, m)] * a_nm[(n + 1, m + 1)] * d_;
+                    sum.x += (m as f64) * a_nm[(n, m)] * e_;
+                    sum.y += (m as f64) * a_nm[(n, m)] * f_;
+                    sum.z += pines.vr01[(n, m)] * a_nm[(n, m + 1)] * d_;
+                    sum.w -= pines.vr11[(n, m)] * a_nm[(n + 1, m + 1)] * d_;
+                }
+                let rr = rho_np1 / eq_radius_km;
+                let mut lock = thread_accel.lock().unwrap();
+                (*lock) += rr * sum;
             }
-            let rr = rho_np1 / eq_radius_km;
-            accel4 += rr * sum;
+        });
+
+        match handle.join() {
+            Ok(_) => {}
+            Err(e) => panic::resume_unwind(e),
         }
+
+        let lock = accel4.lock().unwrap();
+
         let accel = Vector3::new(
-            accel4.x + accel4.w * s_,
-            accel4.y + accel4.w * t_,
-            accel4.z + accel4.w * u_,
+            lock.x + lock.w * s_,
+            lock.y + lock.w * t_,
+            lock.z + lock.w * u_,
         );
         // Rotate this acceleration vector back into the integration frame (no center change needed, it's just a vector)
         // As discussed with Sai, if the Earth was spinning faster, would the acceleration due to the harmonics be any different?
@@ -261,6 +196,9 @@ impl AccelModel for Harmonics {
         osc: &Orbit,
         almanac: Arc<Almanac>,
     ) -> Result<(Vector3<f64>, Matrix3<f64>), DynamicsError> {
+        // Get a reference to Pines
+        let pines = Arc::clone(&self.pines);
+
         // Convert the osculating orbit to the correct frame (needed for multiple harmonic fields)
         let state = almanac
             .transform_to(*osc, self.compute_frame, None)
@@ -279,7 +217,7 @@ impl AccelModel for Harmonics {
         let max_order = self.stor.max_order_m(); // In GMAT, the order is MM
 
         // Create the associated Legendre polynomials. Note that we add three items as per GMAT (this may be useful for the STM)
-        let mut a_nm = self.a_nm_h.clone();
+        let mut a_nm = pines.a_nm_h.clone();
 
         // Initialize the diagonal elements (not a function of the input)
         a_nm[(1, 0)] = u_ * 3.0f64.sqrt();
@@ -292,8 +230,8 @@ impl AccelModel for Harmonics {
         for m in 0..=max_order + 1 {
             for n in (m + 2)..=max_degree + 1 {
                 let hm_idx = (n, m);
-                a_nm[hm_idx] = u_ * self.b_nm_h[hm_idx] * a_nm[(n - 1, m)]
-                    - self.c_nm_h[hm_idx] * a_nm[(n - 2, m)];
+                a_nm[hm_idx] = u_ * pines.b_nm_h[hm_idx] * a_nm[(n - 1, m)]
+                    - pines.c_nm_h[hm_idx] * a_nm[(n - 2, m)];
             }
         }
 
@@ -357,8 +295,8 @@ impl AccelModel for Harmonics {
 
                 sum0 += OHyperdual::from(m as f64) * a_nm[(n, m)] * e_;
                 sum1 += OHyperdual::from(m as f64) * a_nm[(n, m)] * f_;
-                sum2 += self.vr01_h[(n, m)] * a_nm[(n, m + 1)] * d_;
-                sum3 += self.vr11_h[(n, m)] * a_nm[(n + 1, m + 1)] * d_;
+                sum2 += pines.vr01_h[(n, m)] * a_nm[(n, m + 1)] * d_;
+                sum3 += pines.vr11_h[(n, m)] * a_nm[(n + 1, m + 1)] * d_;
             }
             let rr = rho_np1 / eq_radius;
             a0 += rr * sum0;
